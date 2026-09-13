@@ -3,15 +3,8 @@
 #include "cipher.h"
 #include <process.h>
 
-
-// Expected login data for the server.
-typedef struct {
-    char username[USERNAME_LEN];
-    char password[PASSWORD_LEN];
-} LoginRequest;
-
-static const char SERVER_USERNAME[] = "admin";
-static const char SERVER_PASSWORD[] = "12345";
+#define VALID_CLIENT_ID "client"
+#define VALID_CLIENT_PASSWORD "password"
 
 // Send all bytes of a message over the socket.
 static int send_all(SOCKET sock, const void *data, int length)
@@ -75,33 +68,96 @@ static int recv_packet(SOCKET sock, unsigned char *buffer, int *data_len)
     return recv_all(sock, buffer, *data_len);
 }
 
+static void trim_line(char *text)
+{
+    size_t len = strlen(text);
+
+    while (len > 0 &&
+        (text[len - 1] == '\n' || text[len - 1] == '\r'))
+    {
+        text[len - 1] = '\0';
+        len--;
+    }
+}
+
+static int send_encrypted_text(SOCKET sock,
+    unsigned char *buffer,
+    const char *text,
+    int session_key)
+{
+    int plaintext_len = (int)strlen(text);
+    int encrypted_len;
+
+    if (plaintext_len <= 0 || plaintext_len >= MAX_MESSAGE)
+        return -1;
+
+    memcpy(buffer, text, plaintext_len);
+
+    encrypted_len = encrypt(buffer, plaintext_len, session_key);
+
+    if (send_packet(sock, buffer, encrypted_len) != encrypted_len)
+        return -1;
+
+    return encrypted_len;
+}
+
+static int authenticate_client(SOCKET clientSocket,
+    unsigned char *buffer,
+    int session_key)
+{
+    int recv_len;
+    int decrypted_len;
+    char *client_id;
+    char *password;
+    int authenticated = 0;
+
+    if (recv_packet(clientSocket, buffer, &recv_len) <= 0)
+        return 0;
+
+    decrypted_len = decrypt(buffer, recv_len, session_key);
+    buffer[decrypted_len] = '\0';
+
+    client_id = (char *)buffer;
+    password = strchr(client_id, '\n');
+
+    if (password != NULL)
+    {
+        *password = '\0';
+        password++;
+        trim_line(client_id);
+        trim_line(password);
+
+        authenticated =
+            strcmp(client_id, VALID_CLIENT_ID) == 0 &&
+            strcmp(password, VALID_CLIENT_PASSWORD) == 0;
+    }
+
+    if (authenticated)
+    {
+        printf("Authentication successful for client ID: %s\n", client_id);
+
+        if (send_encrypted_text(clientSocket,
+            buffer,
+            "AUTH_OK",
+            session_key) < 0)
+        {
+            return 0;
+        }
+
+        return 1;
+    }
+
+    printf("Authentication failed\n");
+    send_encrypted_text(clientSocket, buffer, "AUTH_FAIL", session_key);
+    return 0;
+}
+
 // Handle one client connection in its own thread.
 unsigned int __stdcall client_thread(void *arg)
 {
     SOCKET clientSocket = (SOCKET)(intptr_t)arg;
-    LoginRequest login;
     unsigned char buffer[MAX_MESSAGE];
     int recv_len;
-
-    // Read the client's login credentials.
-    int login_len;
-    if (recv_packet(clientSocket, (unsigned char *)&login, &login_len) != login_len ||
-        login_len != sizeof(login))
-    {
-        closesocket(clientSocket);
-        return 0;
-    }
-
-    // Validate the credentials before allowing the session.
-    if (strcmp(login.username, SERVER_USERNAME) != 0 ||
-        strcmp(login.password, SERVER_PASSWORD) != 0)
-    {
-        send_packet(clientSocket, (unsigned char *)"FAILED", 6);
-        closesocket(clientSocket);
-        return 0;
-    }
-
-    send_packet(clientSocket, (unsigned char *)"SUCCESS", 7);
 
 /* ===== ECC KEY EXCHANGE ===== */
 
@@ -164,6 +220,11 @@ printf("Session Key : %d\n\n", session_key);
 
 /* ===== END ECC ===== */
 
+if (!authenticate_client(clientSocket, buffer, session_key))
+{
+    closesocket(clientSocket);
+    return 0;
+}
 
     // Echo messages between the client and the server console.
     while (1)
@@ -183,8 +244,16 @@ printf("Session Key : %d\n\n", session_key);
         decrypt(buffer, recv_len, session_key);
 
     buffer[decrypted_len] = '\0';
+    trim_line((char *)buffer);
+    decrypted_len = (int)strlen((char *)buffer);
 
     printf("Plaintext : %s\n", buffer);
+
+    if (strcmp((char *)buffer, "BYE") == 0)
+    {
+        printf("Client requested disconnect. Closing connection.\n");
+        break;
+    }
 
     /* Encrypt again before echoing */
     int encrypted_len =

@@ -2,13 +2,6 @@
 #include "ecc.h"
 #include "cipher.h"
 
-
-typedef struct
-{
-    char username[USERNAME_LEN];
-    char password[PASSWORD_LEN];
-} LoginRequest;
-
 static int send_all(SOCKET sock, const void *data, int length)
 {
     int total = 0;
@@ -66,7 +59,7 @@ static int send_packet(SOCKET sock,
 
     return send_all(sock, data, data_len);
 }
-    static int recv_packet(SOCKET sock,
+static int recv_packet(SOCKET sock,
     unsigned char *buffer,
     int *data_len)
 {
@@ -87,22 +80,104 @@ static int send_packet(SOCKET sock,
     return recv_all(sock, buffer, *data_len);
 }
 
-int main(int argc, char *argv[])
+static void trim_line(char *text)
+{
+    size_t len = strlen(text);
+
+    while (len > 0 &&
+        (text[len - 1] == '\n' || text[len - 1] == '\r'))
+    {
+        text[len - 1] = '\0';
+        len--;
+    }
+}
+
+static int read_required_line(const char *prompt,
+    char *buffer,
+    size_t buffer_size)
+{
+    while (1)
+    {
+        printf("%s", prompt);
+
+        if (!fgets(buffer, (int)buffer_size, stdin))
+            return 0;
+
+        trim_line(buffer);
+
+        if (buffer[0] != '\0')
+            return 1;
+
+        printf("Please enter a value.\n");
+    }
+}
+
+static int read_port_number(void)
+{
+    char input[32];
+
+    while (1)
+    {
+        char *end = NULL;
+        long port;
+
+        if (!read_required_line("Enter server port number: ",
+            input,
+            sizeof(input)))
+        {
+            return -1;
+        }
+
+        port = strtol(input, &end, 10);
+
+        if (end != input && *end == '\0' && port > 0 && port <= 65535)
+            return (int)port;
+
+        printf("Please enter a valid port number (1-65535).\n");
+    }
+}
+
+static int send_encrypted_text(SOCKET sock,
+    unsigned char *buffer,
+    const char *text,
+    int session_key)
+{
+    int plaintext_len = (int)strlen(text);
+    int encrypted_len;
+
+    if (plaintext_len <= 0 || plaintext_len >= MAX_MESSAGE)
+        return -1;
+
+    memcpy(buffer, text, plaintext_len);
+
+    encrypted_len = encrypt(buffer, plaintext_len, session_key);
+
+    if (send_packet(sock, buffer, encrypted_len) != encrypted_len)
+        return -1;
+
+    return encrypted_len;
+}
+
+int main(void)
 {
     WSADATA wsa;
     SOCKET sock = INVALID_SOCKET;
     struct sockaddr_in serverAddr;
     unsigned char buffer[MAX_MESSAGE];
-    char response[MAX_MESSAGE];
-    LoginRequest login;
     int response_len;
-    const char *server_ip = "127.0.0.1";
-    int server_port = PORT;
+    char server_ip[64];
+    int server_port;
 
-    if (argc >= 2)
-        server_ip = argv[1];
-    if (argc >= 3)
-        server_port = atoi(argv[2]);
+    if (!read_required_line("Enter server IP address: ",
+        server_ip,
+        sizeof(server_ip)))
+    {
+        return 1;
+    }
+
+    server_port = read_port_number();
+    if (server_port < 0)
+        return 1;
 
     if (WSAStartup(MAKEWORD(2,2), &wsa) != 0)
     {
@@ -122,6 +197,13 @@ int main(int argc, char *argv[])
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port = htons(server_port);
     serverAddr.sin_addr.s_addr = inet_addr(server_ip);
+    if (serverAddr.sin_addr.s_addr == INADDR_NONE)
+    {
+        fprintf(stderr, "Invalid IP address\n");
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
 
     if (connect(sock, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
     {
@@ -132,41 +214,6 @@ int main(int argc, char *argv[])
     }
 
     printf("Connected to server\n");
-
-    printf("Username: ");
-    scanf("%31s", login.username);
-    printf("Password: ");
-    scanf("%63s", login.password);
-
-    int ch;
-    while ((ch = getchar()) != '\n' && ch != EOF);
-
-    if (send_packet(sock, (unsigned char *)&login, sizeof(login)) != sizeof(login))
-    {
-        fprintf(stderr, "Failed to send login request\n");
-        closesocket(sock);
-        WSACleanup();
-        return 1;
-    }
-
-    if (recv_packet(sock, (unsigned char *)response, &response_len) != response_len)
-    {
-        fprintf(stderr, "Server disconnected before authentication\n");
-        closesocket(sock);
-        WSACleanup();
-        return 1;
-    }
-
-    response[response_len] = '\0';
-    if (strcmp(response, "SUCCESS") != 0)
-    {
-        fprintf(stderr, "Authentication failed\n");
-        closesocket(sock);
-        WSACleanup();
-        return 1;
-    }
-
-    printf("Authentication successful\n");
 
     /* ===== ECC START ===== */
 
@@ -233,6 +280,64 @@ int main(int argc, char *argv[])
 
     /* ===== ECC END ===== */
 
+    char client_id[64];
+    char password[64];
+    char auth_message[MAX_MESSAGE];
+
+    if (!read_required_line("Client ID: ", client_id, sizeof(client_id)) ||
+        !read_required_line("Password: ", password, sizeof(password)))
+    {
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
+
+    if (snprintf(auth_message,
+        sizeof(auth_message),
+        "%s\n%s",
+        client_id,
+        password) >= (int)sizeof(auth_message))
+    {
+        fprintf(stderr, "Authentication data is too long\n");
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
+
+    if (send_encrypted_text(sock,
+        buffer,
+        auth_message,
+        session_key) < 0)
+    {
+        fprintf(stderr, "Failed to send authentication data\n");
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
+
+    if (recv_packet(sock, buffer, &response_len) <= 0)
+    {
+        fprintf(stderr, "Failed to receive authentication response\n");
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
+
+    int auth_response_len =
+        decrypt(buffer, response_len, session_key);
+
+    buffer[auth_response_len] = '\0';
+
+    if (strcmp((char *)buffer, "AUTH_OK") != 0)
+    {
+        printf("Authentication failed. Connection closed.\n");
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
+
+    printf("Authentication successful.\nType BYE to close the connection.\n\n");
+
    while (1)
 {
     printf("Client: ");
@@ -240,10 +345,14 @@ int main(int argc, char *argv[])
     if (!fgets((char *)buffer, MAX_MESSAGE - 1, stdin))
         break;
 
+    trim_line((char *)buffer);
+
     int plaintext_len = (int)strlen((char *)buffer);
 
     if (plaintext_len == 0)
         continue;
+
+    int should_close = strcmp((char *)buffer, "BYE") == 0;
 
     /* Show plaintext */
     printf("\nPlaintext : %s\n", buffer);
@@ -266,16 +375,11 @@ int main(int argc, char *argv[])
     if (send_packet(sock, buffer, encrypted_len) != encrypted_len)
         break;
 
-    /* Receive encrypted response */
-    if (recv_packet(sock, buffer, &response_len) <= 0)
+    if (should_close)
+    {
+        printf("Closing connection.\n");
         break;
-
-    /* Decrypt */
-    int decrypted_len =
-        decrypt(buffer, response_len, session_key);
-
-    /* Add string terminator */
-    buffer[decrypted_len] = '\0';
+    }
 
 }
 

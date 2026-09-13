@@ -17,8 +17,6 @@
 
 #define PORT 8080
 #define MAX_MESSAGE 1024
-#define USERNAME_LEN 32
-#define PASSWORD_LEN 64
 
 typedef struct {
     int x;
