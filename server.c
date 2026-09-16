@@ -5,6 +5,75 @@
 
 #define VALID_CLIENT_ID "client"
 #define VALID_CLIENT_PASSWORD "password"
+#define MAX_CLIENTS 64
+
+volatile int g_server_should_exit = 0;
+SOCKET g_listen_socket = INVALID_SOCKET;
+SOCKET g_active_clients[MAX_CLIENTS];
+int g_client_count = 0;
+
+static void trim_line(char *text);
+
+static void add_client_socket(SOCKET clientSocket)
+{
+    if (g_client_count < MAX_CLIENTS)
+        g_active_clients[g_client_count++] = clientSocket;
+}
+
+static void remove_client_socket(SOCKET clientSocket)
+{
+    int i;
+
+    for (i = 0; i < g_client_count; i++)
+    {
+        if (g_active_clients[i] == clientSocket)
+        {
+            for (int j = i; j < g_client_count - 1; j++)
+                g_active_clients[j] = g_active_clients[j + 1];
+            g_client_count--;
+            break;
+        }
+    }
+}
+
+static void close_all_client_sockets(void)
+{
+    int i;
+
+    for (i = 0; i < g_client_count; i++)
+    {
+        if (g_active_clients[i] != INVALID_SOCKET)
+            closesocket(g_active_clients[i]);
+    }
+
+    g_client_count = 0;
+}
+
+static unsigned int __stdcall server_console_thread(void *arg)
+{
+    char command[64];
+    (void)arg;
+
+    while (!g_server_should_exit)
+    {
+        if (!fgets(command, sizeof(command), stdin))
+            break;
+
+        trim_line(command);
+
+        if (strcmp(command, "BYE") == 0)
+        {
+            printf("Server requested disconnect. Closing active connections.\n");
+            g_server_should_exit = 1;
+            close_all_client_sockets();
+            if (g_listen_socket != INVALID_SOCKET)
+                closesocket(g_listen_socket);
+            break;
+        }
+    }
+
+    return 0;
+}
 
 // Send all bytes of a message over the socket.
 static int send_all(SOCKET sock, const void *data, int length)
@@ -222,51 +291,51 @@ printf("Session Key : %d\n\n", session_key);
 
 if (!authenticate_client(clientSocket, buffer, session_key))
 {
-    closesocket(clientSocket);
-    return 0;
-}
-
-    // Echo messages between the client and the server console.
-    while (1)
-{
-    if (recv_packet(clientSocket, buffer, &recv_len) <= 0)
-        break;
-
-    printf("\nCiphertext (Hex): ");
-
-    for (int i = 0; i < recv_len; i++)
-        printf("%02X ", buffer[i]);
-
-    printf("\n");
-
-    /* Decrypt */
-    int decrypted_len =
-        decrypt(buffer, recv_len, session_key);
-
-    buffer[decrypted_len] = '\0';
-    trim_line((char *)buffer);
-    decrypted_len = (int)strlen((char *)buffer);
-
-    printf("Plaintext : %s\n", buffer);
-
-    if (strcmp((char *)buffer, "BYE") == 0)
-    {
-        printf("Client requested disconnect. Closing connection.\n");
-        break;
+        remove_client_socket(clientSocket);
+        closesocket(clientSocket);
+        return 0;
     }
 
-    /* Encrypt again before echoing */
-    int encrypted_len =
-        encrypt(buffer, decrypted_len, session_key);
+    // Echo messages between the client and the server console.
+    while (!g_server_should_exit)
+    {
+        if (recv_packet(clientSocket, buffer, &recv_len) <= 0)
+            break;
 
-    if (send_packet(clientSocket, buffer, encrypted_len) != encrypted_len)
-        break;
-}
+        printf("\nCiphertext (Hex): ");
 
+        for (int i = 0; i < recv_len; i++)
+            printf("%02X ", buffer[i]);
+
+        printf("\n");
+
+        /* Decrypt */
+        int decrypted_len =
+            decrypt(buffer, recv_len, session_key);
+
+        buffer[decrypted_len] = '\0';
+        trim_line((char *)buffer);
+        decrypted_len = (int)strlen((char *)buffer);
+
+        printf("Plaintext : %s\n", buffer);
+
+        if (strcmp((char *)buffer, "BYE") == 0)
+        {
+            printf("Client requested disconnect. Closing connection.\n");
+            break;
+        }
+
+        /* Encrypt again before echoing */
+        int encrypted_len =
+            encrypt(buffer, decrypted_len, session_key);
+
+        if (send_packet(clientSocket, buffer, encrypted_len) != encrypted_len)
+            break;
+    }
+
+    remove_client_socket(clientSocket);
     closesocket(clientSocket);
     return 0;
-    
-
 }
 
 // Main server entry point.
@@ -292,6 +361,8 @@ int main(void)
         return 1;
     }
 
+    g_listen_socket = listenSocket;
+
     // Bind the socket to the chosen port and start listening.
     memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
@@ -308,20 +379,30 @@ int main(void)
     }
 
     printf("Server listening on port %d\n", PORT);
+    printf("Type BYE at the server console to terminate all connections.\n");
 
-    while (1)
+    uintptr_t consoleThread = _beginthreadex(NULL, 0, server_console_thread, NULL, 0, NULL);
+    if (consoleThread)
+        CloseHandle((HANDLE)consoleThread);
+
+    while (!g_server_should_exit)
     {
         SOCKET clientSocket = accept(listenSocket, NULL, NULL);
+        if (g_server_should_exit)
+            break;
         if (clientSocket == INVALID_SOCKET)
             continue;
 
+        add_client_socket(clientSocket);
         printf("Accepted new client\n");
         uintptr_t threadHandle = _beginthreadex(NULL, 0, client_thread, (void *)(intptr_t)clientSocket, 0, NULL);
         if (threadHandle)
             CloseHandle((HANDLE)threadHandle);
     }
 
+    close_all_client_sockets();
     closesocket(listenSocket);
+    g_listen_socket = INVALID_SOCKET;
     WSACleanup();
     return 0;
 }
